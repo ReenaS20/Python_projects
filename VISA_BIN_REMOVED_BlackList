@@ -1,0 +1,198 @@
+
+
+## VIN-32963 : ALERT | Daily activity monitoring of Visa BINs removed from blacklist
+## For each Visa BIN removed from the blacklist we have to monitoring closely daily FD and chargeback activity on the BIN, both at the overall BIN level and the BIN/merchant level.
+## The daily report should show each BIN, FD volume captured, CB volume on FD captures, CB rate, FD revenue USD captured, CB revenue USD on FD captures
+
+use strict;
+use warnings;
+
+use Project::Authentication;
+use Project::Error;
+use Email::Sender::Simple qw(sendmail);
+use DateTime;
+use Data::Dumper;
+
+Project::Authentication::login_as_root() or return {error => "Failed Project login"};
+
+## Get all VISA BINs for all merchants / single merchant, the date they were removed
+## from blacklist table and the date if ever added back
+## There is a single entry per merchant per BIN in blacklist table, if added back b.deleted value is made null
+my $query  =<<EOQ;
+select
+  cd.bin,
+  date(bh.ts) as removedDate,
+  case
+        when b.deleted is null then (select date(bh2.ts) from blacklist_history bh2 where bh2.operation = 'Add' and bh2.blacklist_id = b.id and
+        bh2.ts > bh.ts)
+        else null
+  end as addeddate,
+  m.name
+  from
+  blacklist_history bh
+  join blacklist b on b.id = bh.blacklist_id
+  join credit_card cd on cd.hash_id = b.hash_id
+  join bin_detail bd on bd.bin = cd.bin
+  left outer join merchant m on m.id = b.merchant_id
+  where
+  bd.brand = 'VISA'
+  and operation = 'Remove'
+  --     and bh.ts > '2024-05-01'
+  group by 1,2,3,4
+  order by 2
+EOQ
+
+my $rows = Project::Obj::query_read_only($query);
+
+## This should never happen as we have entries in blacklist_history table
+if (!defined $rows || scalar @$rows == 0) {
+    send_email("<html><body>No BIN were removed for any merchant or query execution has failed</body></html>");
+    exit();
+}
+
+my ($msg, $alert_msg) = undef;
+foreach my $row (@{$rows}) {
+    my $merchant_name = $row->[3] ? $row->[3] : 'All Merchants';
+    $msg = $msg."<tr><td>$row->[0]</td><td>$row->[1]</td><td>$row->[2]</td><td>$row->[3]</td>";
+    my ($fdcount, $cbcount, $cbrate, $netrevenue) = get_fd_cb_data($row->[0]);
+    $msg = $msg."<td>$fdcount</td><td>$cbcount</td><td>$cbrate</td><td>$netrevenue</td></tr>";
+    if ($merchant_name ne 'All Merchants') {
+        check_criteria_and_generate_alert($row->[0], $merchant_name);
+    }
+}
+
+my $header = "<html><head><style>table, th, td {  border: 1px solid black;  border-collapse: collapse;} th, td {  padding: 8px;}</style></head><body>";
+my $table = "<table style=\"width:100%\"><tr><th>BIN</th><th>Removed Date</th><th>Added Date</th><th>Merchant Name</th><th>FD count</th><th>CB count</tn><th>CB rate</th><th>Net Revenue in USDAmount</th></tr> \n";
+
+$alert_msg = "<h2>ALERTS</h2></br>".$alert_msg if ($alert_msg);
+$msg = $header."<h2>Daily activity monitoring of Visa BINs removed from blacklist</h2>".$table.$msg."</table></br>\n\n".$alert_msg."\n";
+
+send_email($msg);
+
+## Calculate FD and CB for given merchant and for given bin for last 90 days
+## Generate an alert if FD > XX and CB rate > YY%
+sub check_criteria_and_generate_alert {
+    my $bin = shift;
+    my $merchant = shift;
+
+    my $cbratethreshold = 10;
+    my $fdthreshold = 15;
+
+    my $fdquery =<<EOQ;
+        select count(*)
+        from
+        transaction t
+        join transaction_detail td on td.transaction_id = t.id
+        join payment_method pm on pm.id = td.payment_method_id
+        join credit_card cc on cc.id = pm.id
+        join merchant m on m.id = t.merchant_id
+        where cc.bin = $bin
+        and m.name = '$merchant'
+        and t.current_merchant_ts > (now() - interval '90 days')
+        and t.forced_deposit = 1
+        and t.current_disposition_id = 2
+EOQ
+
+    my $fdcount =  Project::Obj::query_read_only($fdquery, 'firstrow' => 1);
+
+    if ($fdcount->[0] > 0 && $fdcount->[0] > $fdthreshold) {
+        $alert_msg .= "Forced Deposit count for $merchant is $fdcount->[0] in last 90 days</br>\n";
+    }
+
+    my $cbquery  =<<EOQ;
+        select count(*)
+        from
+        chargeback c
+        join credit_card cc on cc.id = c.credit_card_id
+        join transaction t on t.id = c.transaction_id
+        join merchant m on m.id = c.merchant_id
+        where
+        t.forced_deposit = 1
+        and cc.bin = $bin
+        and m.name = '$merchant'
+        and c.processor_received_time  > (now() - interval '90 days')
+EOQ
+
+    my $cbcount =  Project::Obj::query_read_only($cbquery, 'firstrow' => 1);
+
+    my $cbrate = ($cbcount->[0] / $fdcount->[0]) * 100 if ($fdcount->[0] > 0);
+
+    if (defined $cbrate && $cbrate > $cbratethreshold) {
+        $alert_msg .= "Chargeback Rate for $merchant is $cbrate in last 90 days</br>\n";
+    }
+    return;
+}
+
+## Fetch total FDs and CBs along with the amount for last 90 days for irrepective of merchants
+## Calculate CB Rate and Net revenue
+sub get_fd_cb_data {
+    my $bin = shift;
+
+    my ($fdcount, $fd_amount, $cbcount, $cb_amount, $cbrate, $netrevenue) = undef;
+
+    my $fdquery =<<EOQ;
+        select count(*), sum(round(t.amount/(select round(rate, 2) from exchange_rate where id in(select max(er.id) from exchange_rate er where er.currency_code_id = td.currency_code_id)),2)) as USDAmount
+        from
+        transaction t
+        join transaction_detail td on td.transaction_id = t.id
+        join payment_method pm on pm.id = td.payment_method_id
+        join credit_card cc on cc.id = pm.id
+        where cc.bin = $bin
+        and t.current_merchant_ts > (now() - interval '90 days')
+        and t.forced_deposit = 1
+        and t.current_disposition_id = 2
+EOQ
+
+    my $fdrows = Project::Obj::query_read_only($fdquery);
+
+    $fdcount = $fdrows->[0]->[0];
+    $fd_amount = $fdrows->[0]->[1];
+
+    my $cbquery  =<<EOQ;
+        select count(*), sum(round(c.amount/(select round(rate, 2) from exchange_rate where id in(select max(er.id) from exchange_rate er where er.currency_code_id = c.currency_code_id)),2)) as USDAmount
+        from
+        chargeback c
+        join credit_card cc on cc.id = c.credit_card_id
+        join transaction t on t.id = c.transaction_id
+        where
+        t.forced_deposit = 1
+        and cc.bin = $bin
+        and c.processor_received_time  > (now() - interval '90 days')
+EOQ
+
+    my $cbrows =  Project::Obj::query_read_only($cbquery);
+
+    $cbcount = $cbrows->[0]->[0];
+    $cb_amount = $cbrows->[0]->[1];
+    $cbrate = ($fdcount && $cbcount) ? $cbcount / $fdcount : 0;
+    $netrevenue = ($fd_amount || $cb_amount) ? $fd_amount - $cb_amount : 0;
+
+    return ($fdcount, $cbcount, $cbrate, $netrevenue);
+}
+
+sub send_email {
+    my $msg = shift;
+
+    my $To = "pmehta\@Project.com";
+    my $from = 'billing_reports\@Project.com';
+    my $subject = "[PROD]: Daily report of Visa BINs removed from blacklist\n";
+    my $mail_headers_hr = {'MIME-Version' => '1.0',
+                            'Content-Type' => 'text/html',
+                            'From' => $from,
+                            'Subject' => $subject,
+                            'To' => $To
+                            };
+
+
+    my $mailer = new Mail::Mailer;
+    eval {
+        $mailer->open($mail_headers_hr);
+        print $mailer $msg;
+        $mailer->close();
+    };
+    if ($@) {
+        return Error("Could not send email:  $@");
+    }
+    Note("Mail sent to $To");
+    return 1;
+}
