@@ -1,0 +1,96 @@
+#created a new alert for CSD to be notified when the daily count of auth reponse  9594 and P9594 errors exceed 150.
+#However, since Sunday, 7/28/24, those errors have reappeared daily but not at the volumes that would have exceeded the threshold of 150 errors/day, and therefore, this report continues not to report them. 
+#Updated an Equifax Retain alert for Response codes 9594 and P9594 at the end of each day and trigger an email if the total count exceeds the threshold of 50.
+#Impact
+#No impact on BRD/any process as this is the standalone script.
+#Created alert script has a SELECT (read-only) SQL query to fetch the merchant's failed transactions.
+#NOTE: New Script is attached
+
+
+
+
+
+#!/usr/bin/perl
+
+use strict;
+
+use warnings;
+
+use Project::Authentication;
+use Project::Conf::Stack;
+use Time::Piece;
+use Project::Conf;
+use Project::Error;
+use Project::DateUtil2 qw(here_now);
+use MIME::Lite;
+use Email::Sender::Simple qw(sendmail);
+use Project::Interval qw(add_interval_to_timestamp);
+use v5.16;
+LogToStderr(1);
+
+my $date = localtime->strftime('%m/%d/%Y - %H:%M');
+my $recipients = "ITManagementequifax_dl@amdocs.com";
+my $cc  = "ProjectPaymentOPS\@Project.com";
+
+my $config_query = <<EOM;
+SELECT m.id,
+m.name,
+date(e.created) as trx_date,
+count(*)
+FROM transaction t
+JOIN merchant m on m.id = t.merchant_id
+JOIN latest_transaction_detail ltd ON t.id = ltd.transaction_id
+JOIN transaction_detail td ON td.id = ltd.transaction_detail_id
+JOIN entity e ON e.id = t.entity_id
+JOIN merchant_customer mc on mc.id = t.current_merchant_customer_id
+WHERE t.current_merchant_ts >= date(now())
+and m.name in ('Equifax Retain')
+and t.auth_response_code in ('9594','P9594')
+group by 1,2,3
+having count(*) >= 50;
+EOM
+
+my $rows = Project::Obj::query_read_only($config_query);
+my ($str,$rv);
+my $subject = "Equifax Retain number of 9594 and P9594 errors";
+my $body = "<html><head>";
+$body .= "<style>table, th, td {  border: 1px solid black;  border-collapse: collapse; align: center; } th, td {  padding: 8px;}</style></head><body><h3>Equifax Retain number of 9594 and P9594 errors on $date</h3></br><table style=\"width:50%\">\n";
+
+if (scalar(@$rows) > 0) {
+    foreach my $row ( @$rows ) {
+        my $merchant_id = $row->[0];
+        my $merchant_name = $row->[1];
+        my $txn_date = $row->[2];
+        my $txn_count = $row->[3];
+        $str .= "<tr><td align=\"center\">$merchant_id</td>
+        <td align=\"center\">$merchant_name</td>
+        <td align=\"center\">$txn_date</td>
+        <td align=\"center\">$txn_count</td>"
+    }
+    $body .= "<tr><th>Merchant ID</th><th>Merchant Name</th><th>Transaction Date</th><th>Transaction Count</th></tr>\n";
+    $body .= $str;
+    $body .= "</table>";
+} else {
+    $body .= "Today's Equifax Retain number of 9594 and P9594 errors did not exceed 50 threshold";
+}
+
+$body .= "</body></html>\n";
+send_email($recipients,$cc,$body,$subject);
+
+sub send_email {
+  my($to,$cc,$body,$subject) = @_;
+
+  my $msg = MIME::Lite->new(
+        From    => "reports\@Project.com",
+        To      => $to,
+        Cc      => $cc,
+        Subject => $subject,
+        Type    => 'text/html',
+        Data    => $body,
+    );
+    eval {
+        $rv = sendmail( $msg->as_string );
+    };
+    print "Email sent !\n";
+}
+exit(0);
