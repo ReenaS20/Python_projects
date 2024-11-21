@@ -1,0 +1,101 @@
+## VIN-32719 - ALERT | Prod | New alert is required to track CB for MasterCard
+## Multilayer alert will be generated for each Merchant where USD equivalent of Chargeback amounts associated with FD MasterCard transactions will exceed $10,000 USD (level 1 alert) or $25,000 USD (level 2) for the given calendar month, i.e., if job runs on 10/11/24, only Chargeback that are received and processed between 10/01/24 and 10/31/24.
+## Usage : sudo perl chargeback_excessive_amount_alert.pl
+
+use strict;
+use warnings;
+
+use Project::Authentication;
+use Project::Error;
+use Email::Sender::Simple qw(sendmail);
+use DateTime;
+
+Project::Authentication::login_as_root() or return {error => "Failed Project login"};
+
+# Calculate start and end date for  this month
+my $today = DateTime->now();
+my $start_date = $today->clone()->set_day(1)->ymd;
+my $end_date = $today->clone()->set_day(1)->add( months => 1 )->subtract( days => 1 )->ymd;
+
+Note("Running query from $start_date to $end_date");
+
+my $query  =<<EOQ;
+select m.id||'-'||m.name as merchant_name,
+       sum(round(td.amount/(select round(rate, 2) from exchange_rate where id in(select max(er.id) from exchange_rate er where er.currency_code_id = td.currency_code_id)),2)) as USDAmount
+from transaction t
+JOIN latest_transaction_detail ltd ON t.id = ltd.transaction_id
+JOIN transaction_detail td ON td.id = ltd.transaction_detail_id
+JOIN payment_method pm on pm.id = td.payment_method_id
+JOIN credit_card cd on cd.id = pm.credit_card_id
+JOIN bin_detail bd on bd.bin = cd.bin
+JOIN merchant m on m.id = t.merchant_id
+JOIN chargeback cb on cb.transaction_id = t.id
+where t.current_merchant_ts >= '$start_date'
+and t.current_merchant_ts < '$end_date'
+and m.type_id = 11
+and m.select_only = 1
+and t.forced_deposit = 1
+and t.current_disposition_id = 2
+and bd.brand = 'MASTERCARD'
+group by 1
+EOQ
+
+my $rows = Project::Obj::query_read_only($query);
+
+if (!defined $rows || scalar @$rows == 0) {
+    send_email("<html><body>No Chargebacks filed for any merchant in this month</body></html>");
+}
+
+my ($msg, $msg1, $msg2) = undef;
+foreach my $row (@{$rows}) {
+    if ($row->[1] >= 25000) {
+        $msg2 = $msg2. "<tr><td>$row->[0]</td><td>$row->[1]</td></tr> \n";
+    } elsif ($row->[1] >= 10000) {
+        $msg1 = $msg1. "<tr><td>$row->[0]</td><td>$row->[1]</td></tr> \n";
+    }
+}
+
+my $header = "<html><head><style>table, th, td {  border: 1px solid black;  border-collapse: collapse;} th, td {  padding: 8px;}</style></head><body>";
+my $table = "<table style=\"width:100%\"><tr><th>Merchant ID and Name</th><th>USDAmount</th></tr> \n";
+
+$msg = $header.get_title(10000).$table.$msg1."</table></br>\n" if ($msg1);
+$msg = $msg.get_title(25000).$table.$msg2."</table></br>\n" if ($msg2);
+
+if ($msg) {
+    $msg = $msg."</body></html>";
+    send_email($msg);
+} else {
+    send_email("<html><body>No Chargebacks exceed 10000 USD for any merchant</body></html>");
+}
+
+sub send_email {
+    my $msg = shift;
+
+    my $To = 'vin_brd_alert\@as.com,PPOPS\@Project.com,RAT\@as.com,rk\@Project.com';
+    my $from = 'billing_reports\@Project.com';
+    my $subject = "[PROD]: Alert for MasterCard Chargebacks Amounts\n";
+    my $mail_headers_hr = {'MIME-Version' => '1.0',
+                            'Content-Type' => 'text/html',
+                            'From' => $from,
+                            'Subject' => $subject,
+                            'To' => $To
+                            };
+
+
+    my $mailer = new Mail::Mailer;
+    eval {
+        $mailer->open($mail_headers_hr);
+        print $mailer $msg;
+        $mailer->close();
+    };
+    if ($@) {
+        return Error("Could not send email:  $@");
+    }
+    Note("Mail sent to $To");
+    return 1;
+}
+
+sub get_title {
+    my $value = shift;
+    return  "*********************** PROD: Sum of Chargebacks greater than $value for MasterCard *********************** </br></br>";
+}
